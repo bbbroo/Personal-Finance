@@ -3,13 +3,14 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 from dateutil import parser as date_parser
 from fastapi import HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,7 +19,7 @@ from app.core.enums import DuplicateStatus, ImportStatus, StagedRowStatus, Trans
 from app.core.money import MoneyError, dollars_to_cents
 from app.core.paths import NORMALIZED_IMPORTS_DIR, ORIGINAL_IMPORTS_DIR
 from app.core.security import normalized_hash, sha256_bytes
-from app.models.domain import ImportBatch, ImportMappingPreset, StagedImportRow, Transaction, TransferLink, utc_now
+from app.models.domain import Account, ImportBatch, ImportMappingPreset, StagedImportRow, Transaction, TransferLink, TransferLinkMember, utc_now
 from app.schemas.common import StagedRowUpdate, TransactionCreate
 from app.services.audit_service import record_audit
 from app.services.backup_service import create_backup
@@ -138,6 +139,86 @@ def _write_normalized(batch_id: str, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _row_counts(rows: list[StagedImportRow]) -> dict[str, int]:
+    return {
+        "valid": sum(1 for row in rows if row.validation_status != StagedRowStatus.ERROR),
+        "warnings": sum(1 for row in rows if row.warnings_json),
+        "errors": sum(1 for row in rows if row.validation_status == StagedRowStatus.ERROR),
+        "duplicates": sum(1 for row in rows if row.duplicate_status != DuplicateStatus.UNIQUE),
+        "skipped": sum(1 for row in rows if row.user_action == UserAction.SKIP),
+    }
+
+
+def _set_batch_counts(batch: ImportBatch, rows: list[StagedImportRow]) -> None:
+    counts = _row_counts(rows)
+    batch.row_count = len(rows)
+    batch.valid_row_count = counts["valid"]
+    batch.warning_count = counts["warnings"]
+    batch.error_count = counts["errors"]
+    batch.duplicate_row_count = counts["duplicates"]
+    batch.skipped_row_count = counts["skipped"]
+
+
+def _stage_rows(
+    db: Session,
+    *,
+    batch: ImportBatch,
+    reader: csv.DictReader,
+    mapping: dict[str, str | None],
+    account_id: str | None,
+) -> list[StagedImportRow]:
+    staged_rows: list[StagedImportRow] = []
+    normalized_records: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for index, raw in enumerate(reader, start=2):
+        normalized, errors, warnings = normalize_row(raw, mapping, account_id=account_id, row_number=index)
+        row_hash = _staged_hash(normalized)
+        fingerprint = (
+            transaction_fingerprint(
+                normalized["account_id"],
+                normalized["transaction_date"],
+                normalized["amount_cents"],
+                normalized["merchant_name"] or normalized["original_description"],
+            )
+            if not errors
+            else row_hash
+        )
+        duplicate_status = DuplicateStatus.UNIQUE
+        user_action = UserAction.IMPORT
+        if row_hash in seen_hashes:
+            duplicate_status = DuplicateStatus.DUPLICATE
+            user_action = UserAction.SKIP
+            warnings.append("Duplicate within this file.")
+        elif not errors and db.scalar(select(Transaction.id).where(Transaction.fingerprint == fingerprint).limit(1)):
+            duplicate_status = DuplicateStatus.DUPLICATE
+            user_action = UserAction.SKIP
+            warnings.append("Exact duplicate of an existing transaction.")
+        elif not errors and _similar_existing(db, normalized):
+            duplicate_status = DuplicateStatus.POSSIBLE_DUPLICATE
+            warnings.append("Possible duplicate based on amount/date/merchant.")
+        seen_hashes.add(row_hash)
+        status = StagedRowStatus.ERROR if errors else (StagedRowStatus.WARNING if warnings else StagedRowStatus.VALID)
+        staged = StagedImportRow(
+            import_batch_id=batch.id,
+            row_number=index,
+            raw_json=raw,
+            normalized_json=normalized,
+            normalized_hash=row_hash,
+            validation_status=status,
+            duplicate_status=duplicate_status,
+            user_action=user_action,
+            errors_json=errors or None,
+            warnings_json=warnings or None,
+        )
+        db.add(staged)
+        staged_rows.append(staged)
+        normalized_records.append(normalized)
+    db.flush()
+    _set_batch_counts(batch, staged_rows)
+    batch.normalized_file_path = str(_write_normalized(batch.id, normalized_records))
+    return staged_rows
+
+
 async def upload_csv(
     db: Session,
     *,
@@ -185,66 +266,32 @@ async def upload_csv(
     db.add(batch)
     db.flush()
 
-    normalized_records: list[dict[str, Any]] = []
-    seen_hashes: set[str] = set()
-    counts = {"valid": 0, "warnings": 0, "errors": 0, "duplicates": 0, "skipped": 0}
-    for index, raw in enumerate(reader, start=2):
-        normalized, errors, warnings = normalize_row(raw, mapping, account_id=account_id, row_number=index)
-        row_hash = _staged_hash(normalized)
-        fingerprint = (
-            transaction_fingerprint(
-                normalized["account_id"],
-                normalized["transaction_date"],
-                normalized["amount_cents"],
-                normalized["merchant_name"] or normalized["original_description"],
-            )
-            if not errors
-            else row_hash
-        )
-        duplicate_status = DuplicateStatus.UNIQUE
-        user_action = UserAction.IMPORT
-        if row_hash in seen_hashes:
-            duplicate_status = DuplicateStatus.DUPLICATE
-            user_action = UserAction.SKIP
-            warnings.append("Duplicate within this file.")
-        elif not errors and db.scalar(select(Transaction.id).where(Transaction.fingerprint == fingerprint).limit(1)):
-            duplicate_status = DuplicateStatus.DUPLICATE
-            user_action = UserAction.SKIP
-            warnings.append("Exact duplicate of an existing transaction.")
-        elif not errors and _similar_existing(db, normalized):
-            duplicate_status = DuplicateStatus.POSSIBLE_DUPLICATE
-            warnings.append("Possible duplicate based on amount/date/merchant.")
-        seen_hashes.add(row_hash)
-        status = StagedRowStatus.ERROR if errors else (StagedRowStatus.WARNING if warnings else StagedRowStatus.VALID)
-        counts["errors"] += 1 if errors else 0
-        counts["warnings"] += 1 if warnings else 0
-        counts["valid"] += 1 if not errors else 0
-        counts["duplicates"] += 1 if duplicate_status != DuplicateStatus.UNIQUE else 0
-        counts["skipped"] += 1 if user_action == UserAction.SKIP else 0
-        staged = StagedImportRow(
-            import_batch_id=batch.id,
-            row_number=index,
-            raw_json=raw,
-            normalized_json=normalized,
-            normalized_hash=row_hash,
-            validation_status=status,
-            duplicate_status=duplicate_status,
-            user_action=user_action,
-            errors_json=errors or None,
-            warnings_json=warnings or None,
-        )
-        db.add(staged)
-        normalized_records.append(normalized)
-    batch.row_count = len(normalized_records)
-    batch.valid_row_count = counts["valid"]
-    batch.warning_count = counts["warnings"]
-    batch.error_count = counts["errors"]
-    batch.duplicate_row_count = counts["duplicates"]
-    batch.skipped_row_count = counts["skipped"]
-    batch.normalized_file_path = str(_write_normalized(batch.id, normalized_records))
-    db.flush()
+    _stage_rows(db, batch=batch, reader=reader, mapping=mapping, account_id=account_id)
     detect_transfers(db, batch)
     record_audit(db, entity_type="import", entity_id=batch.id, action="stage", after=batch, source="import")
+    return batch
+
+
+def remap_batch(db: Session, batch: ImportBatch, mapping: dict[str, str | None]) -> ImportBatch:
+    if batch.status in {ImportStatus.COMMITTED, ImportStatus.ROLLED_BACK}:
+        raise HTTPException(status_code=409, detail="Committed or rolled back imports cannot be remapped.")
+    original = Path(batch.original_file_path)
+    if not original.exists():
+        raise HTTPException(status_code=404, detail="Original CSV file is missing; remap cannot safely reparse rows.")
+    before = as_dict(batch)
+    preset = db.get(ImportMappingPreset, batch.mapping_preset_id) if batch.mapping_preset_id else None
+    if preset:
+        preset.version += 1
+        preset.mapping_json = mapping
+        batch.mapping_preset_version = preset.version
+    db.execute(delete(StagedImportRow).where(StagedImportRow.import_batch_id == batch.id))
+    text = original.read_text(encoding="utf-8-sig")
+    reader = csv.DictReader(StringIO(text))
+    _stage_rows(db, batch=batch, reader=reader, mapping=mapping, account_id=batch.account_id)
+    batch.status = ImportStatus.STAGED
+    db.expire(batch, ["staged_rows"])
+    detect_transfers(db, batch)
+    record_audit(db, entity_type="import", entity_id=batch.id, action="remap", before=before, after=batch, source="import")
     return batch
 
 
@@ -285,11 +332,15 @@ def validate_batch(db: Session, batch: ImportBatch) -> ImportBatch:
             errors.append("Invalid or missing transaction date.")
         row.errors_json = errors or None
         row.warnings_json = warnings or None
+        if row.user_action == UserAction.SKIP:
+            row.validation_status = StagedRowStatus.SKIPPED
+            skipped_count += 1
+            warning_count += 1 if warnings else 0
+            continue
         row.validation_status = StagedRowStatus.ERROR if errors else (StagedRowStatus.WARNING if warnings else StagedRowStatus.VALID)
         error_count += 1 if errors else 0
         warning_count += 1 if warnings else 0
         valid_count += 1 if not errors else 0
-        skipped_count += 1 if row.user_action == UserAction.SKIP else 0
     batch.valid_row_count = valid_count
     batch.warning_count = warning_count
     batch.error_count = error_count
@@ -323,16 +374,165 @@ def detect_duplicates(db: Session, batch: ImportBatch) -> ImportBatch:
     return batch
 
 
+TRANSFER_KEYWORDS = {
+    "transfer",
+    "payment",
+    "pay",
+    "ach",
+    "autopay",
+    "card",
+    "credit card",
+    "brokerage",
+    "schwab",
+    "vanguard",
+    "fidelity",
+    "hsa",
+    "contribution",
+}
+
+
+def _description_has_transfer_context(*descriptions: str | None) -> bool:
+    text = " ".join(description or "" for description in descriptions).lower()
+    return any(keyword in text for keyword in TRANSFER_KEYWORDS)
+
+
+def _account_transfer_bonus(db: Session, account_id: str | None, other_account_id: str | None) -> int:
+    if not account_id or not other_account_id or account_id == other_account_id:
+        return 0
+    account = db.get(Account, account_id)
+    other = db.get(Account, other_account_id)
+    if not account or not other:
+        return 0
+    account_types = {account.account_type, other.account_type}
+    if account_types & {"credit_card", "brokerage", "retirement", "hsa", "crypto_exchange", "crypto_wallet", "liability"}:
+        return 8
+    return 2
+
+
+def _transfer_score(
+    db: Session,
+    *,
+    normalized: dict[str, Any],
+    other_account_id: str | None,
+    other_description: str | None,
+    other_date: date,
+    other_transaction_type: str | None = None,
+) -> tuple[int, str]:
+    txn_date = date.fromisoformat(normalized["transaction_date"])
+    day_delta = abs((txn_date - other_date).days)
+    score = 70
+    bases = ["equal_opposite_amount"]
+    if day_delta <= 1:
+        score += 15
+        bases.append("one_day_window")
+    else:
+        score += 5
+        bases.append("three_day_window")
+    if _description_has_transfer_context(normalized.get("original_description"), other_description):
+        score += 12
+        bases.append("transfer_context")
+    score += _account_transfer_bonus(db, normalized.get("account_id"), other_account_id)
+    if other_transaction_type == "transfer" or normalized.get("transaction_type") == "transfer":
+        score += 8
+        bases.append("transfer_type")
+    return min(score, 99), "_".join(bases)
+
+
+def _side(amount_cents: int) -> str:
+    return "outflow" if amount_cents < 0 else "inflow"
+
+
+def _add_transfer_member(
+    db: Session,
+    *,
+    link: TransferLink,
+    account_id: str,
+    amount_cents: int,
+    staged_row_id: str | None = None,
+    transaction_id: str | None = None,
+) -> None:
+    db.add(
+        TransferLinkMember(
+            transfer_link_id=link.id,
+            transaction_id=transaction_id,
+            staged_row_id=staged_row_id,
+            account_id=account_id,
+            amount_cents=amount_cents,
+            side=_side(amount_cents),
+        )
+    )
+
+
+def _transfer_member_exists(db: Session, link_id: str, *, transaction_id: str | None = None, staged_row_id: str | None = None) -> bool:
+    query = select(TransferLinkMember.id).where(TransferLinkMember.transfer_link_id == link_id)
+    if transaction_id:
+        query = query.where(TransferLinkMember.transaction_id == transaction_id)
+    if staged_row_id:
+        query = query.where(TransferLinkMember.staged_row_id == staged_row_id)
+    return bool(db.scalar(query.limit(1)))
+
+
+def _set_transfer_candidate(
+    row: StagedImportRow,
+    *,
+    link: TransferLink,
+    candidate_type: str,
+    candidate_id: str,
+    score: int,
+    basis: str,
+) -> None:
+    status = TransferStatus.CONFIRMED_TRANSFER if score >= 95 else TransferStatus.SUGGESTED_TRANSFER
+    row.transfer_status = status
+    normalized = dict(row.normalized_json)
+    normalized["transfer_candidate"] = {
+        "transfer_link_id": link.id,
+        "candidate_type": candidate_type,
+        "candidate_id": candidate_id,
+        "confidence_score": score,
+        "match_basis": basis,
+        "status": "confirmed" if score >= 95 else "suggested",
+    }
+    row.normalized_json = normalized
+    warnings = list(row.warnings_json or [])
+    label = "Confirmed high-confidence transfer pair." if score >= 95 else "Suggested transfer pair needs review."
+    if label not in warnings:
+        warnings.append(label)
+    row.warnings_json = warnings
+
+
 def detect_transfers(db: Session, batch: ImportBatch) -> ImportBatch:
+    if batch.status in {ImportStatus.COMMITTED, ImportStatus.ROLLED_BACK}:
+        raise HTTPException(status_code=409, detail="Committed or rolled back imports cannot be re-detected.")
     rows = [row for row in batch.staged_rows if row.validation_status != StagedRowStatus.ERROR]
+    staged_ids = [row.id for row in rows if row.id]
+    if staged_ids:
+        link_ids = list(
+            db.scalars(
+                select(TransferLinkMember.transfer_link_id).where(TransferLinkMember.staged_row_id.in_(staged_ids))
+            )
+        )
+        for link_id in set(link_ids):
+            link = db.get(TransferLink, link_id)
+            if link and link.created_by == "system" and link.status in {"suggested", "confirmed"}:
+                db.delete(link)
+        db.flush()
     for row in rows:
+        if row.transfer_status != TransferStatus.REJECTED_TRANSFER:
+            row.transfer_status = TransferStatus.NOT_TRANSFER
+            normalized = dict(row.normalized_json)
+            normalized.pop("transfer_candidate", None)
+            row.normalized_json = normalized
+    paired_keys: set[tuple[str, str]] = set()
+    for row in rows:
+        if row.transfer_status == TransferStatus.REJECTED_TRANSFER:
+            continue
         normalized = row.normalized_json
         amount = normalized.get("amount_cents")
         txn_date_raw = normalized.get("transaction_date")
         if amount is None or txn_date_raw is None:
             continue
         txn_date = date.fromisoformat(txn_date_raw)
-        candidates: list[tuple[str, int, str]] = []
+        candidates: list[tuple[str, str, int, str, dict[str, Any] | Transaction]] = []
         for other in rows:
             if other.id == row.id:
                 continue
@@ -341,8 +541,15 @@ def detect_transfers(db: Session, batch: ImportBatch) -> ImportBatch:
                 other_date = date.fromisoformat(other_norm["transaction_date"])
                 day_delta = abs((txn_date - other_date).days)
                 if day_delta <= 3:
-                    score = 98 if day_delta <= 1 else 88
-                    candidates.append((other.id, score, "staged_equal_opposite_amount_date_window"))
+                    score, basis = _transfer_score(
+                        db,
+                        normalized=normalized,
+                        other_account_id=other_norm.get("account_id"),
+                        other_description=other_norm.get("original_description"),
+                        other_date=other_date,
+                        other_transaction_type=other_norm.get("transaction_type"),
+                    )
+                    candidates.append(("staged_row", other.id, score, basis, other_norm))
         existing = db.scalars(
             select(Transaction).where(
                 Transaction.amount_cents == -amount,
@@ -352,18 +559,73 @@ def detect_transfers(db: Session, batch: ImportBatch) -> ImportBatch:
             )
         )
         for txn in existing:
-            score = 96 if abs((txn.transaction_date - txn_date).days) <= 1 else 86
-            candidates.append((txn.id, score, "existing_equal_opposite_amount_date_window"))
-        if candidates:
-            best = max(candidates, key=lambda item: item[1])
-            row.transfer_status = (
-                TransferStatus.CONFIRMED_TRANSFER if best[1] >= 95 else TransferStatus.SUGGESTED_TRANSFER
+            score, basis = _transfer_score(
+                db,
+                normalized=normalized,
+                other_account_id=txn.account_id,
+                other_description=txn.original_description,
+                other_date=txn.transaction_date,
+                other_transaction_type=txn.transaction_type,
             )
-            warnings = list(row.warnings_json or [])
-            label = "Confirmed high-confidence transfer match." if best[1] >= 95 else "Suggested transfer match needs review."
-            if label not in warnings:
-                warnings.append(label)
-            row.warnings_json = warnings
+            candidates.append(("transaction", txn.id, score, basis, txn))
+        if candidates:
+            candidate_type, candidate_id, score, basis, candidate = max(candidates, key=lambda item: item[2])
+            pair_key = tuple(sorted([f"staged:{row.id}", f"{candidate_type}:{candidate_id}"]))
+            if pair_key in paired_keys:
+                continue
+            paired_keys.add(pair_key)
+            status = "confirmed" if score >= 95 else "suggested"
+            link = TransferLink(
+                confidence_score=str(Decimal(score) / Decimal("100")),
+                match_basis=basis,
+                status=status,
+                created_by="system",
+                confirmed_at=utc_now() if status == "confirmed" else None,
+            )
+            db.add(link)
+            db.flush()
+            _add_transfer_member(
+                db,
+                link=link,
+                account_id=normalized["account_id"],
+                amount_cents=amount,
+                staged_row_id=row.id,
+            )
+            _set_transfer_candidate(
+                row,
+                link=link,
+                candidate_type=candidate_type,
+                candidate_id=candidate_id,
+                score=score,
+                basis=basis,
+            )
+            if candidate_type == "staged_row":
+                other = next(candidate_row for candidate_row in rows if candidate_row.id == candidate_id)
+                other_norm = other.normalized_json
+                _add_transfer_member(
+                    db,
+                    link=link,
+                    account_id=other_norm["account_id"],
+                    amount_cents=other_norm["amount_cents"],
+                    staged_row_id=other.id,
+                )
+                _set_transfer_candidate(
+                    other,
+                    link=link,
+                    candidate_type="staged_row",
+                    candidate_id=row.id,
+                    score=score,
+                    basis=basis,
+                )
+            elif isinstance(candidate, Transaction):
+                _add_transfer_member(
+                    db,
+                    link=link,
+                    account_id=candidate.account_id,
+                    amount_cents=candidate.amount_cents,
+                    transaction_id=candidate.id,
+                )
+    db.flush()
     return batch
 
 
@@ -408,9 +670,35 @@ def update_staged_row(db: Session, row: StagedImportRow, payload: StagedRowUpdat
         setattr(row, key, value)
     if payload.normalized_json is not None:
         row.normalized_hash = _staged_hash(payload.normalized_json)
-        row.user_action = UserAction.EDIT
+        if payload.user_action is None:
+            row.user_action = UserAction.EDIT
+        errors: list[str] = []
+        warnings = list(row.warnings_json or [])
+        normalized = payload.normalized_json
+        if normalized.get("amount_cents") is None:
+            errors.append("Missing amount; missing money cannot be treated as zero.")
+        if normalized.get("transaction_date") is None:
+            errors.append("Invalid or missing transaction date.")
+        if normalized.get("account_id") is None:
+            errors.append("Missing target account.")
+        if not normalized.get("original_description"):
+            errors.append("Missing description.")
+        row.errors_json = errors or None
+        row.warnings_json = warnings or None
+        row.validation_status = StagedRowStatus.ERROR if errors else (StagedRowStatus.WARNING if warnings else StagedRowStatus.VALID)
+    if payload.duplicate_status == DuplicateStatus.CONFIRMED_DUPLICATE:
+        row.user_action = UserAction.SKIP
+    elif payload.duplicate_status == DuplicateStatus.IGNORED_DUPLICATE and row.user_action == UserAction.SKIP:
+        row.user_action = UserAction.IMPORT
+    if payload.transfer_status == TransferStatus.REJECTED_TRANSFER:
+        normalized = dict(row.normalized_json)
+        normalized.pop("transfer_candidate", None)
+        row.normalized_json = normalized
+    if row.user_action == UserAction.SKIP:
+        row.validation_status = StagedRowStatus.SKIPPED
     db.flush()
     record_audit(db, entity_type="staged_import_row", entity_id=row.id, action="update", before=before, after=row)
+    db.flush()
     return row
 
 
@@ -431,9 +719,10 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
     backup = create_backup(db, backup_type="pre_import", notes=f"Before import {batch.original_filename}")
     manifest: dict[str, list[dict[str, Any]]] = {"created": [], "updated": [], "deleted": []}
     try:
-        transfer_link_cache: dict[str, str] = {}
         for row in batch.staged_rows:
-            if row.user_action == UserAction.SKIP or row.validation_status == StagedRowStatus.ERROR:
+            if row.user_action == UserAction.SKIP or row.validation_status in {StagedRowStatus.ERROR, StagedRowStatus.SKIPPED}:
+                continue
+            if row.duplicate_status in {DuplicateStatus.DUPLICATE, DuplicateStatus.CONFIRMED_DUPLICATE}:
                 continue
             normalized = row.normalized_json
             payload = TransactionCreate(
@@ -466,22 +755,49 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
                 source_id=batch.id,
                 created_by_import_batch_id=batch.id,
             )
-            if row.transfer_status == TransferStatus.CONFIRMED_TRANSFER:
-                link_key = f"{abs(payload.amount_cents)}:{payload.transaction_date.isoformat()}"
-                if link_key not in transfer_link_cache:
-                    link = TransferLink(
-                        confidence_score="0.98",
-                        match_basis="exact_amount_date_window",
-                        status="confirmed",
-                        created_by="system",
-                        confirmed_at=utc_now(),
-                    )
-                    db.add(link)
-                    db.flush()
-                    transfer_link_cache[link_key] = link.id
-                txn.transfer_link_id = transfer_link_cache[link_key]
+            candidate = normalized.get("transfer_candidate") if row.transfer_status != TransferStatus.REJECTED_TRANSFER else None
+            link = db.get(TransferLink, candidate.get("transfer_link_id")) if candidate else None
+            if row.transfer_status == TransferStatus.CONFIRMED_TRANSFER and link:
+                link.status = "confirmed"
+                link.confirmed_at = link.confirmed_at or utc_now()
+                txn.transfer_link_id = link.id
+            elif row.transfer_status == TransferStatus.SUGGESTED_TRANSFER and link:
+                txn.transfer_link_id = link.id
             db.add(txn)
             db.flush()
+            if link and not _transfer_member_exists(db, link.id, transaction_id=txn.id):
+                _add_transfer_member(
+                    db,
+                    link=link,
+                    transaction_id=txn.id,
+                    account_id=txn.account_id,
+                    amount_cents=txn.amount_cents,
+                )
+            if link and row.transfer_status == TransferStatus.CONFIRMED_TRANSFER and candidate.get("candidate_type") == "transaction":
+                existing_txn = db.get(Transaction, candidate.get("candidate_id"))
+                if existing_txn:
+                    before_existing = as_dict(existing_txn)
+                    existing_txn.transfer_status = TransferStatus.CONFIRMED_TRANSFER
+                    existing_txn.transfer_link_id = link.id
+                    if not _transfer_member_exists(db, link.id, transaction_id=existing_txn.id):
+                        _add_transfer_member(
+                            db,
+                            link=link,
+                            transaction_id=existing_txn.id,
+                            account_id=existing_txn.account_id,
+                            amount_cents=existing_txn.amount_cents,
+                        )
+                    manifest["updated"].append({"entity_type": "transaction", "entity_id": existing_txn.id, "before": before_existing})
+                    record_audit(
+                        db,
+                        entity_type="transaction",
+                        entity_id=existing_txn.id,
+                        action="update",
+                        before=before_existing,
+                        after=existing_txn,
+                        source="import",
+                        source_id=batch.id,
+                    )
             row.final_record_type = "transaction"
             row.final_record_id = txn.id
             manifest["created"].append({"entity_type": "transaction", "entity_id": txn.id})
@@ -553,6 +869,26 @@ def rollback_batch(db: Session, batch: ImportBatch) -> ImportBatch:
                 entity_id=item["entity_id"],
                 action="delete",
                 before=before,
+                source="import",
+                source_id=batch.id,
+            )
+    for item in reversed(manifest.get("updated", [])):
+        if item["entity_type"] == "transaction":
+            txn = db.get(Transaction, item["entity_id"])
+            before_state = item.get("before") or {}
+            if txn is None or not before_state:
+                continue
+            before = as_dict(txn)
+            for key in ["transfer_status", "transfer_link_id", "review_status", "duplicate_status", "notes"]:
+                if key in before_state:
+                    setattr(txn, key, before_state[key])
+            record_audit(
+                db,
+                entity_type="transaction",
+                entity_id=txn.id,
+                action="rollback_update",
+                before=before,
+                after=txn,
                 source="import",
                 source_id=batch.id,
             )

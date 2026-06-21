@@ -11,8 +11,11 @@ from app.models.domain import (
     AccountStatement,
     DataQualityIssue,
     HoldingSnapshot,
+    Liability,
+    LiabilityTermsHistory,
     Price,
 )
+from app.services.holding_service import latest_holdings_as_of
 
 
 def _issue(**kwargs) -> DataQualityIssue:
@@ -85,7 +88,7 @@ def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
                 )
             )
 
-    holdings = list(db.scalars(select(HoldingSnapshot).where(HoldingSnapshot.is_current.is_(True))))
+    holdings = latest_holdings_as_of(db, as_of=today)
     for holding in holdings:
         if holding.cost_basis_quality in {"missing", "incomplete"}:
             issues.append(
@@ -124,6 +127,37 @@ def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
                 recommended_action="Run reconciliation or accept an explicit difference.",
             )
         )
+
+    for liability in db.scalars(select(Liability).where(Liability.status == "active")):
+        terms = db.scalars(
+            select(LiabilityTermsHistory)
+            .where(LiabilityTermsHistory.liability_id == liability.id)
+            .order_by(LiabilityTermsHistory.effective_date.desc())
+        ).first()
+        if liability.minimum_payment_cents is None and (terms is None or terms.minimum_payment_cents is None):
+            issues.append(
+                _issue(
+                    severity="warning",
+                    issue_type="missing_liability_terms",
+                    entity_type="liability",
+                    entity_id=liability.id,
+                    title="Liability is missing payment terms",
+                    description="Debt payoff projections need a verified minimum payment.",
+                    recommended_action="Add or verify the liability minimum payment.",
+                )
+            )
+        if terms is None or terms.apr_decimal is None:
+            issues.append(
+                _issue(
+                    severity="warning",
+                    issue_type="missing_liability_terms",
+                    entity_type="liability",
+                    entity_id=liability.id,
+                    title="Liability is missing APR",
+                    description="Payoff projections are estimates until APR is entered and verified.",
+                    recommended_action="Add current APR terms for this liability.",
+                )
+            )
 
     for price in db.scalars(select(Price).where(Price.status.in_(["stale", "missing", "failed"]))):
         issues.append(

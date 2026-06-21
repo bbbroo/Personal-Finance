@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.maintenance import set_restore_in_progress
 from app.core.paths import BACKUPS_DIR, DAILY_BACKUPS_DIR, PRE_IMPORT_BACKUPS_DIR, PRE_RESTORE_BACKUPS_DIR
 from app.core.security import sha256_file
 from app.models.domain import BackupManifest
@@ -58,6 +59,59 @@ def validate_sqlite(path: Path) -> None:
                 "recommended_action": "Create a new backup or choose a different restore file.",
             },
         ) from exc
+
+
+def _manifest_path_for_backup(source: Path) -> Path:
+    return source.with_suffix(".manifest.json")
+
+
+def validate_backup_manifest(source: Path) -> dict:
+    manifest_path = _manifest_path_for_backup(source)
+    if not source.exists() or not manifest_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "BACKUP_NOT_FOUND",
+                "message": "Backup database or manifest file was not found.",
+                "details": {"backup_path": str(source), "manifest_path": str(manifest_path)},
+                "recommended_action": "Choose a backup created by this app.",
+            },
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "BACKUP_MANIFEST_INVALID",
+                "message": "Backup manifest is not valid JSON.",
+                "details": {"manifest_path": str(manifest_path), "error": str(exc)},
+                "recommended_action": "Choose a different backup.",
+            },
+        ) from exc
+    required = {"app_version", "schema_version", "created_at", "backup_type", "database_sha256"}
+    missing = sorted(required - set(manifest))
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "BACKUP_MANIFEST_INCOMPLETE",
+                "message": "Backup manifest is missing required fields.",
+                "details": {"missing": missing, "manifest_path": str(manifest_path)},
+                "recommended_action": "Choose a backup created by this version of the app.",
+            },
+        )
+    if sha256_file(source) != manifest.get("database_sha256"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "BACKUP_HASH_MISMATCH",
+                "message": "Backup hash does not match its manifest.",
+                "details": {"backup_path": str(source)},
+                "recommended_action": "Do not restore this backup; choose a valid backup.",
+            },
+        )
+    return manifest
 
 
 def create_backup(db: Session, *, backup_type: str = "manual", notes: str | None = None) -> BackupManifest:
@@ -116,33 +170,40 @@ def list_backups(db: Session) -> list[BackupManifest]:
 
 def restore_backup(db: Session, backup_path: str) -> dict:
     source = Path(backup_path).resolve()
-    manifest_path = source.with_suffix(".manifest.json")
-    if not source.exists() or not manifest_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error_code": "BACKUP_NOT_FOUND",
-                "message": "Backup database or manifest file was not found.",
-                "details": {"backup_path": str(source), "manifest_path": str(manifest_path)},
-                "recommended_action": "Choose a backup created by this app.",
-            },
-        )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if sha256_file(source) != manifest.get("database_sha256"):
+    active_path = _database_path(db)
+    if source == active_path:
         raise HTTPException(
             status_code=422,
             detail={
-                "error_code": "BACKUP_HASH_MISMATCH",
-                "message": "Backup hash does not match its manifest.",
+                "error_code": "RESTORE_SOURCE_IS_ACTIVE_DATABASE",
+                "message": "The active database file cannot be restored over itself.",
                 "details": {"backup_path": str(source)},
-                "recommended_action": "Do not restore this backup; choose a valid backup.",
+                "recommended_action": "Choose a backup file from the backups directory.",
             },
         )
+    manifest = validate_backup_manifest(source)
     validate_sqlite(source)
-    pre_restore = create_backup(db, backup_type="pre_restore", notes=f"Before restoring {source.name}")
-    active_path = _database_path(db)
-    db.commit()
-    db.bind.dispose()
-    active_path.write_bytes(source.read_bytes())
-    validate_sqlite(active_path)
-    return {"restored": True, "restored_from": str(source), "pre_restore_backup_id": pre_restore.id}
+    set_restore_in_progress(True)
+    temp_restore = active_path.with_name(f"{active_path.name}.restore_tmp")
+    try:
+        pre_restore = create_backup(db, backup_type="pre_restore", notes=f"Before restoring {source.name}")
+        db.commit()
+        temp_restore.write_bytes(source.read_bytes())
+        validate_sqlite(temp_restore)
+        bind = db.get_bind()
+        db.close()
+        bind.dispose()
+        temp_restore.replace(active_path)
+        validate_sqlite(active_path)
+        return {
+            "restored": True,
+            "restored_from": str(source),
+            "backup_schema_version": manifest.get("schema_version"),
+            "pre_restore_backup_id": pre_restore.id,
+            "restart_required": True,
+            "message": "Restore completed safely. Restart the local app so all SQLite connections reopen on the restored database.",
+        }
+    finally:
+        set_restore_in_progress(False)
+        if temp_restore.exists():
+            temp_restore.unlink()

@@ -5,6 +5,7 @@ import { api } from "@/api/client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Input } from "@/components/ui/input";
 import { LoadingBlock } from "@/components/ui/loading";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { ApiRecord } from "@/types";
@@ -32,7 +33,7 @@ export function Backups() {
         </div>
         <p className="mt-2 text-sm text-muted-foreground">Restore validates the manifest and creates a pre-restore backup before replacing the active database.</p>
         {restore.isError ? <p className="mt-2 text-sm text-danger">{restore.error.message}</p> : null}
-        {restore.isSuccess ? <p className="mt-2 text-sm text-emerald-700">Restore completed.</p> : null}
+        {restore.isSuccess ? <p className="mt-2 text-sm text-emerald-700">{String((restore.data as ApiRecord).message ?? "Restore completed. Restart the app.")}</p> : null}
       </div>
       {!rows.length ? <EmptyState title="No backups yet" detail="Run a manual backup or commit an import to create one." /> : (
         <div className="overflow-hidden rounded-lg border bg-card">
@@ -55,4 +56,3 @@ export function Backups() {
     </>
   );
 }
-import { Input } from "@/components/ui/input";

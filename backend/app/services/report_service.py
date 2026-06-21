@@ -21,6 +21,7 @@ from app.models.domain import (
     Transaction,
     TransactionSplit,
 )
+from app.services.holding_service import latest_holdings_as_of
 
 
 def _latest_balance(
@@ -36,17 +37,15 @@ def _latest_balance(
 
 
 def _current_holdings(db: Session, account_id: str, as_of: date) -> list[HoldingSnapshot]:
-    return list(
-        db.scalars(
-            select(HoldingSnapshot)
-            .where(
-                HoldingSnapshot.account_id == account_id,
-                HoldingSnapshot.snapshot_date <= as_of,
-                HoldingSnapshot.is_current.is_(True),
-            )
-            .order_by(HoldingSnapshot.snapshot_date.desc())
-        )
-    )
+    return latest_holdings_as_of(db, account_id=account_id, as_of=as_of)
+
+
+def _normalize_balance_for_account(account: Account, balance_cents: int) -> int:
+    if account.balance_sign_policy == "invert_imported":
+        return -balance_cents
+    if account.balance_sign_policy == "liability_positive":
+        return abs(balance_cents)
+    return balance_cents
 
 
 def _holding_value(holding: HoldingSnapshot) -> tuple[int | None, list[str]]:
@@ -96,7 +95,7 @@ def calculate_net_worth(db: Session, as_of: date | None = None) -> dict[str, Any
                 account_warnings.append("Missing balance snapshot")
                 missing_count += 1
             else:
-                value = balance.balance_cents
+                value = _normalize_balance_for_account(account, balance.balance_cents)
                 confidence = Confidence(balance.confidence)
                 if (as_of - balance.snapshot_date).days > account.freshness_threshold_days:
                     account_warnings.append("Balance snapshot is stale")
@@ -113,7 +112,7 @@ def calculate_net_worth(db: Session, as_of: date | None = None) -> dict[str, Any
             else:
                 balance = _latest_balance(db, account.id, as_of)
                 if balance and balance.balance_cents is not None:
-                    value = abs(balance.balance_cents)
+                    value = abs(_normalize_balance_for_account(account, balance.balance_cents))
                     confidence = Confidence(balance.confidence)
                 else:
                     missing_count += 1
@@ -136,7 +135,7 @@ def calculate_net_worth(db: Session, as_of: date | None = None) -> dict[str, Any
                 if account.valuation_method == ValuationMethod.HOLDINGS_PLUS_CASH:
                     cash = _latest_balance(db, account.id, as_of, kinds=["cash", "cash_position"])
                     if cash and cash.balance_cents is not None:
-                        value += cash.balance_cents
+                        value += _normalize_balance_for_account(account, cash.balance_cents)
                         confidences.append(cash.confidence)
                     else:
                         full_balance = _latest_balance(db, account.id, as_of)
@@ -147,7 +146,7 @@ def calculate_net_worth(db: Session, as_of: date | None = None) -> dict[str, Any
             else:
                 fallback = _latest_balance(db, account.id, as_of)
                 if fallback and fallback.balance_cents is not None:
-                    value = fallback.balance_cents
+                    value = _normalize_balance_for_account(account, fallback.balance_cents)
                     confidence = Confidence(fallback.confidence)
                     account_warnings.append("Using account balance fallback because holdings are missing")
                 else:
@@ -284,17 +283,22 @@ def spending_by_category(db: Session, start_date: date, end_date: date) -> list[
     ]
 
 
-def asset_allocation(db: Session, as_of: date | None = None) -> dict[str, Any]:
+def asset_allocation(db: Session, as_of: date | None = None, *, mode: str = "investment_only") -> dict[str, Any]:
     as_of = as_of or date.today()
-    holdings = list(
-        db.scalars(
-            select(HoldingSnapshot).where(HoldingSnapshot.snapshot_date <= as_of, HoldingSnapshot.is_current.is_(True))
-        )
-    )
+    if mode not in {"investment_only", "full_net_worth"}:
+        raise ValueError("mode must be investment_only or full_net_worth")
+    holdings = latest_holdings_as_of(db, as_of=as_of)
     totals: dict[str, int] = defaultdict(int)
     warnings: list[str] = []
     total = 0
+    holding_account_ids: set[str] = set()
     for holding in holdings:
+        account = db.get(Account, holding.account_id)
+        if not account or not account.include_in_net_worth or not account.is_active:
+            continue
+        if mode == "investment_only" and account.account_type not in {"brokerage", "retirement", "hsa", "crypto_exchange", "crypto_wallet"}:
+            continue
+        holding_account_ids.add(account.id)
         instrument = db.get(Instrument, holding.instrument_id)
         override = db.scalars(
             select(SymbolAllocationOverride).where(SymbolAllocationOverride.instrument_id == holding.instrument_id)
@@ -309,6 +313,43 @@ def asset_allocation(db: Session, as_of: date | None = None) -> dict[str, Any]:
         if asset_class == "other":
             warnings.append(f"{instrument.symbol if instrument else holding.id}: needs asset class classification")
         warnings.extend([f"{instrument.symbol if instrument else holding.id}: {warning}" for warning in holding_warnings])
+    if mode == "full_net_worth":
+        accounts = db.scalars(
+            select(Account).where(Account.is_active.is_(True), Account.include_in_net_worth.is_(True)).order_by(Account.name)
+        )
+        for account in accounts:
+            if account.valuation_method == ValuationMethod.EXCLUDED:
+                continue
+            is_liability = account.valuation_method == ValuationMethod.LIABILITY_BALANCE or account.account_type in {
+                "credit_card",
+                "liability",
+            }
+            if account.valuation_method == ValuationMethod.HOLDINGS_PLUS_CASH:
+                cash = _latest_balance(db, account.id, as_of, kinds=["cash", "cash_position"])
+                if cash and cash.balance_cents is not None:
+                    value = _normalize_balance_for_account(account, cash.balance_cents)
+                    totals["cash"] += value
+                    total += value
+                continue
+            if account.valuation_method == ValuationMethod.HOLDINGS_SUM and account.id in holding_account_ids:
+                continue
+            balance = _latest_balance(db, account.id, as_of)
+            value: int | None = None
+            if is_liability:
+                liability = db.scalars(select(Liability).where(Liability.account_id == account.id)).first()
+                if liability:
+                    value = -abs(liability.current_balance_cents)
+                elif balance and balance.balance_cents is not None:
+                    value = -abs(_normalize_balance_for_account(account, balance.balance_cents))
+            elif account.valuation_method in {ValuationMethod.BALANCE_SNAPSHOT, ValuationMethod.MANUAL}:
+                if balance and balance.balance_cents is not None:
+                    value = _normalize_balance_for_account(account, balance.balance_cents)
+            if value is None:
+                warnings.append(f"{account.name}: missing allocation value")
+                continue
+            asset_class = "liability" if is_liability else ("cash" if account.account_type == "cash" else account.account_type)
+            totals[asset_class] += value
+            total += value
     slices = [
         {
             "asset_class": asset_class,
@@ -319,6 +360,7 @@ def asset_allocation(db: Session, as_of: date | None = None) -> dict[str, Any]:
     ]
     return {
         "as_of": as_of.isoformat(),
+        "mode": mode,
         "total_cents": total,
         "slices": slices,
         "confidence": Confidence.LOW if warnings else Confidence.HIGH,

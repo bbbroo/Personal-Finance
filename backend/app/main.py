@@ -31,19 +31,32 @@ from app.api.routes import (
     transactions,
 )
 from app.core.config import get_settings
-from app.core.database import Base, SessionLocal, engine
+from app.core.database import SessionLocal
 from app.core.logging import configure_logging
+from app.core.maintenance import restore_in_progress
 from app.core.paths import ensure_data_dirs
 from app.models import domain  # noqa: F401
 from app.services.daily_refresh_service import run_daily_refresh
 from app.services.seed_service import ensure_seed_data
+from sqlalchemy import text
+
+
+def verify_schema_ready() -> None:
+    with SessionLocal() as db:
+        try:
+            db.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+            db.execute(text("SELECT 1 FROM accounts LIMIT 1"))
+        except Exception as exc:
+            raise RuntimeError(
+                "Database schema is not ready. Run `cd backend; python -m alembic upgrade head` before starting the app."
+            ) from exc
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     ensure_data_dirs()
-    Base.metadata.create_all(bind=engine)
+    verify_schema_ready()
     settings_obj = get_settings()
     with SessionLocal() as db:
         if settings_obj.demo_seed_enabled:
@@ -63,6 +76,22 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def block_writes_during_restore(request: Request, call_next):
+        if restore_in_progress() and request.method in {"POST", "PUT", "PATCH", "DELETE"} and not request.url.path.endswith(
+            "/api/backups/restore"
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error_code": "RESTORE_IN_PROGRESS",
+                    "message": "A restore is in progress; write operations are temporarily blocked.",
+                    "details": {},
+                    "recommended_action": "Wait for restore to finish, then restart the app if requested.",
+                },
+            )
+        return await call_next(request)
 
     @app.exception_handler(Exception)
     async def standard_exception_handler(_request: Request, exc: Exception):

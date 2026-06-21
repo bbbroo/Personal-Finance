@@ -39,12 +39,7 @@ def get_import(import_batch_id: str, db: Session = Depends(get_db)):
 
 @router.post("/imports/{import_batch_id}/map")
 def remap_import(import_batch_id: str, mapping: dict, db: Session = Depends(get_db)):
-    batch = get_or_404(db, ImportBatch, import_batch_id)
-    preset = db.get(ImportMappingPreset, batch.mapping_preset_id) if batch.mapping_preset_id else None
-    if preset:
-        preset.version += 1
-        preset.mapping_json = mapping
-        batch.mapping_preset_version = preset.version
+    batch = import_service.remap_batch(db, get_or_404(db, ImportBatch, import_batch_id), mapping)
     db.commit()
     return as_dict(batch)
 

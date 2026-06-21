@@ -4,8 +4,14 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.domain import AccountStatement, DataQualityIssue, ReconciliationRun, Transaction, utc_now
+from app.models.domain import Account, AccountStatement, DataQualityIssue, ReconciliationRun, Transaction, utc_now
 from app.services.audit_service import record_audit
+
+
+def _transaction_balance_effect(account: Account | None, amount_cents: int) -> int:
+    if account and account.balance_sign_policy in {"liability_positive", "invert_imported"}:
+        return -amount_cents
+    return amount_cents
 
 
 def run_reconciliation(db: Session, statement: AccountStatement, tolerance_cents: int = 0) -> ReconciliationRun:
@@ -19,6 +25,7 @@ def run_reconciliation(db: Session, statement: AccountStatement, tolerance_cents
                 "recommended_action": "Enter both statement balances before running reconciliation.",
             },
         )
+    account = db.get(Account, statement.account_id)
     txns = db.scalars(
         select(Transaction).where(
             Transaction.account_id == statement.account_id,
@@ -27,7 +34,7 @@ def run_reconciliation(db: Session, statement: AccountStatement, tolerance_cents
             Transaction.is_hidden.is_(False),
         )
     )
-    calculated = statement.opening_balance_cents + sum(txn.amount_cents for txn in txns)
+    calculated = statement.opening_balance_cents + sum(_transaction_balance_effect(account, txn.amount_cents) for txn in txns)
     difference = calculated - statement.ending_balance_cents
     status = "matched" if abs(difference) <= tolerance_cents else "mismatch"
     statement.status = "reconciled" if status == "matched" else "mismatch"

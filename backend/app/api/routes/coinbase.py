@@ -15,10 +15,13 @@ router = APIRouter(prefix="/coinbase", tags=["coinbase"])
 @router.get("/status")
 def status(db: Session = Depends(get_db)):
     row = db.get(AppSetting, "coinbase")
-    configured = bool(row and row.value_json.get("api_key_configured"))
     return {
-        "configured": configured,
+        "implemented": False,
+        "configured": False,
+        "stored_local_preferences": bool(row),
         "read_only_required": True,
+        "sync_available": False,
+        "message": "Coinbase credentialed sync is not implemented in V1. Do not enter private keys, seed phrases, or write-enabled credentials.",
         "cost_basis_policy": "Coinbase API cost basis is incomplete unless a tax/report export is imported or manually verified.",
     }
 
@@ -34,7 +37,11 @@ def configure(payload: CoinbaseConfigure, db: Session = Depends(get_db)):
     else:
         row.value_json = payload.model_dump()
     db.commit()
-    return status(db)
+    result = status(db)
+    result["warnings"] = [
+        "Preference saved, but Coinbase sync remains not implemented; no external Coinbase data will be fetched."
+    ]
+    return result
 
 
 @router.delete("/configure")
@@ -49,9 +56,11 @@ def delete_config(db: Session = Depends(get_db)):
 @router.post("/sync")
 def sync(db: Session = Depends(get_db)):
     return {
-        "status": "not_configured_or_manual_only",
+        "status": "not_implemented",
         "synced": False,
-        "warnings": ["Coinbase sync is read-only and disabled until local API credentials are configured."],
+        "warnings": [
+            "Coinbase sync is not implemented in this V1 build. Use CSV/manual imports; cost basis remains incomplete until verified."
+        ],
     }
 
 

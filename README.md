@@ -62,19 +62,25 @@ Use Import Center:
 
 1. Select a target account.
 2. Choose a CSV file.
-3. Review staged rows, validation warnings, duplicate status, and transfer status.
-4. Commit only after preview.
-5. Roll back committed imports from the same import batch.
+3. Edit or paste a JSON column mapping and reparse the original CSV if auto-detection is wrong.
+4. Review staged rows, validation warnings, duplicate status, transfer status, and row actions.
+5. Edit normalized staged rows, skip rows, confirm/ignore duplicates, and confirm/reject transfer candidates.
+6. Commit only after preview.
+7. Roll back committed imports from the same import batch.
 
 Sample files are in `sample_imports\`. Import `checking_transactions.csv`, then import `duplicate_checking_transactions.csv` to see duplicate detection.
 
-Every committed import creates a pre-import SQLite backup and an import rollback manifest.
+Every staged-row edit is audit logged. Every committed import creates a pre-import SQLite backup and an import rollback manifest.
 
 ## Backup And Restore
 
 Backups are listed in the Backups screen and stored under `data\backups`.
 
-Backup manifests include app version, schema version, timestamp, backup type, database SHA-256, source path, and notes. Restore validates the manifest, hash, and SQLite integrity before replacing the active database, and creates a pre-restore backup first.
+Backup manifests include app version, schema version, timestamp, backup type, database SHA-256, source path, and notes. Restore validates the manifest, hash, and SQLite integrity before replacing the active database, creates a pre-restore backup first, blocks writes during restore, and asks for an app restart after the database is swapped.
+
+## Prices And Coinbase
+
+Price refresh is local-first. V1 marks stale/missing prices and supports manual prices; no external price provider is enabled by default. Coinbase sync is intentionally labeled not implemented in this build. Do not enter private keys, seed phrases, or write-enabled credentials. Coinbase cost basis remains incomplete unless verified manually or imported from a trusted tax/report export.
 
 ## Financial Integrity Notes
 
@@ -95,6 +101,7 @@ Backup manifests include app version, schema version, timestamp, backup type, da
 - If ports are occupied, stop the existing process or run backend/frontend manually on different ports.
 - If the database is missing or invalid, run `cd backend; python -m alembic upgrade head`.
 - If imports fail, fix or skip rows with fatal errors before committing.
+- If frontend dependencies behave strangely because of a copied or zipped `node_modules`, delete `frontend\node_modules` and run `npm install` again.
 
 ## Current Limits
 

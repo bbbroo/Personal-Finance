@@ -23,10 +23,10 @@ def dashboard_report(db: Session = Depends(get_db)):
 
 
 @router.get("/net-worth")
-def net_worth(db: Session = Depends(get_db)):
+def net_worth(as_of: date | None = None, db: Session = Depends(get_db)):
     from app.services.report_service import calculate_net_worth
 
-    return {"current": calculate_net_worth(db), "history": net_worth_history(db)}
+    return {"current": calculate_net_worth(db, as_of), "history": net_worth_history(db)}
 
 
 @router.get("/cash-flow")
@@ -59,5 +59,5 @@ def investment_value(db: Session = Depends(get_db)):
 
 
 @router.get("/allocation")
-def allocation_report(db: Session = Depends(get_db)):
-    return asset_allocation(db)
+def allocation_report(mode: str = "investment_only", as_of: date | None = None, db: Session = Depends(get_db)):
+    return asset_allocation(db, as_of=as_of, mode=mode)

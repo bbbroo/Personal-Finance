@@ -39,6 +39,24 @@ export function Liabilities() {
       <div className="rounded-lg border bg-card p-4 text-sm">
         {(plan.data?.warnings ?? []).map((warning) => <div key={warning} className="text-yellow-900">{warning}</div>)}
         {!plan.data?.warnings.length ? <div className="text-muted-foreground">Projection inputs are available for active liabilities.</div> : null}
+        {plan.data?.rows?.length ? (
+          <div className="mt-3 overflow-auto">
+            <Table>
+              <TableHeader><TableRow><TableHead>Balance</TableHead><TableHead>APR</TableHead><TableHead>Months</TableHead><TableHead>Interest</TableHead><TableHead>Quality</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {plan.data.rows.map((row) => (
+                  <TableRow key={String(row.liability_id)}>
+                    <TableCell>{formatCents(row.balance_cents as number)}</TableCell>
+                    <TableCell>{String(row.apr_decimal ?? "Missing")}</TableCell>
+                    <TableCell>{String(row.projected_payoff_months ?? "Unknown")}</TableCell>
+                    <TableCell>{formatCents(row.estimated_interest_cents as number | null)}</TableCell>
+                    <TableCell><Badge tone={row.projection_quality === "terms_verified" ? "success" : "warning"}>{String(row.projection_quality)}</Badge></TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : null}
       </div>
     </>
   );

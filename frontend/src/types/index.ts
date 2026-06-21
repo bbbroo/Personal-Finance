@@ -52,6 +52,7 @@ export type DashboardReport = {
 };
 
 export type AllocationReport = {
+  mode?: string;
   total_cents: number;
   confidence: string;
   warnings: string[];
@@ -67,6 +68,7 @@ export type ImportBatch = ApiRecord & {
   error_count: number;
   warning_count: number;
   duplicate_row_count: number;
+  skipped_row_count?: number;
 };
 
 export type StagedRow = ApiRecord & {

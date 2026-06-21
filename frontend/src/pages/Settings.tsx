@@ -10,9 +10,9 @@ import { PageHeader } from "./PageHeader";
 export function Settings() {
   const client = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.get<Record<string, unknown>>("/settings") });
-  const coinbase = useQuery({ queryKey: ["coinbase"], queryFn: () => api.get<{ configured: boolean; cost_basis_policy: string }>("/coinbase/status") });
+  const coinbase = useQuery({ queryKey: ["coinbase"], queryFn: () => api.get<{ configured: boolean; implemented: boolean; sync_available: boolean; message: string; cost_basis_policy: string }>("/coinbase/status") });
   const configure = useMutation({ mutationFn: () => api.post("/coinbase/configure", { api_key_configured: true, read_only_confirmed: true }), onSuccess: () => client.invalidateQueries({ queryKey: ["coinbase"] }) });
-  const remove = useMutation({ mutationFn: () => fetch("/api/coinbase/configure", { method: "DELETE" }), onSuccess: () => client.invalidateQueries({ queryKey: ["coinbase"] }) });
+  const remove = useMutation({ mutationFn: () => api.delete("/coinbase/configure"), onSuccess: () => client.invalidateQueries({ queryKey: ["coinbase"] }) });
   if (settings.isLoading) return <LoadingBlock label="Loading settings" />;
   return (
     <>
@@ -30,7 +30,9 @@ export function Settings() {
         <Card>
           <CardHeader><CardTitle>Coinbase Read-Only</CardTitle></CardHeader>
           <CardContent className="space-y-3 text-sm">
-            <div className="flex justify-between"><span>Status</span><Badge tone={coinbase.data?.configured ? "success" : "neutral"}>{coinbase.data?.configured ? "configured" : "not configured"}</Badge></div>
+            <div className="flex justify-between"><span>Credentialed sync</span><Badge tone="neutral">{coinbase.data?.implemented ? "implemented" : "not implemented"}</Badge></div>
+            <div className="flex justify-between"><span>Configured</span><Badge tone={coinbase.data?.configured ? "success" : "neutral"}>{coinbase.data?.configured ? "configured" : "not configured"}</Badge></div>
+            <p className="text-muted-foreground">{coinbase.data?.message}</p>
             <p className="text-muted-foreground">{coinbase.data?.cost_basis_policy}</p>
             <div className="flex gap-2">
               <Button size="sm" variant="outline" onClick={() => configure.mutate()}>Mark Read-Only Configured</Button>

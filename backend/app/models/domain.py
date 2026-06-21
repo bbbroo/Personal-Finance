@@ -109,6 +109,29 @@ class TransferLink(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    members: Mapped[list[TransferLinkMember]] = relationship(
+        back_populates="transfer_link", cascade="all, delete-orphan"
+    )
+
+
+class TransferLinkMember(Base):
+    __tablename__ = "transfer_link_members"
+    __table_args__ = (
+        UniqueConstraint("transfer_link_id", "transaction_id", name="uq_transfer_link_transaction_member"),
+        UniqueConstraint("transfer_link_id", "staged_row_id", name="uq_transfer_link_staged_member"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    transfer_link_id: Mapped[str] = mapped_column(ForeignKey("transfer_links.id", ondelete="CASCADE"), nullable=False)
+    transaction_id: Mapped[str | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"))
+    staged_row_id: Mapped[str | None] = mapped_column(ForeignKey("staged_import_rows.id", ondelete="SET NULL"))
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    side: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    transfer_link: Mapped[TransferLink] = relationship(back_populates="members")
+
 
 class Transaction(Base, TimestampMixin):
     __tablename__ = "transactions"
@@ -222,7 +245,6 @@ class ImportBatch(Base):
 
 class StagedImportRow(Base):
     __tablename__ = "staged_import_rows"
-    __table_args__ = (UniqueConstraint("import_batch_id", "normalized_hash", name="uq_staged_row_hash"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     import_batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), nullable=False)
@@ -524,6 +546,20 @@ class DailyRefreshRun(Base):
     created_snapshot: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     errors_json: Mapped[list | None] = mapped_column(JSON)
     warnings_json: Mapped[list | None] = mapped_column(JSON)
+
+
+class DailyAppSnapshot(Base):
+    __tablename__ = "daily_app_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True)
+    net_worth_cents: Mapped[int | None] = mapped_column(Integer)
+    assets_cents: Mapped[int | None] = mapped_column(Integer)
+    liabilities_cents: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
+    warnings_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class DataQualityIssue(Base):

@@ -158,6 +158,7 @@ class HoldingCreate(BaseModel):
     cost_basis_cents: int | None = None
     cost_basis_source: str = "manual"
     cost_basis_quality: str = "user_entered"
+    replace_existing: bool = False
     notes: str | None = None
 
 
@@ -166,6 +167,8 @@ class ManualPriceCreate(BaseModel):
     price_date: date
     price_decimal: str
     provider: str = "manual"
+    provider_symbol: str | None = None
+    market_session: str = "manual"
     status: str = "manual_override"
     confidence: str = "medium"
 

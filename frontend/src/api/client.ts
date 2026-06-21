@@ -26,6 +26,7 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body)
     }),
+  delete: <T>(path: string) => request<T>(path, { method: "DELETE" }),
   uploadImport: (file: File, accountId: string, institution?: string) => {
     const form = new FormData();
     form.append("file", file);

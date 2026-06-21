@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -7,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.domain import HoldingSnapshot
 from app.schemas.common import HoldingCreate
-from app.services.holding_service import create_holding_snapshot
+from app.services.holding_service import create_holding_snapshot, latest_holdings_as_of
 from app.services.report_service import asset_allocation
 from app.services.serialization import as_dict, as_dict_list
 
@@ -15,10 +17,8 @@ router = APIRouter(tags=["holdings"])
 
 
 @router.get("/holdings")
-def holdings(db: Session = Depends(get_db)):
-    return as_dict_list(
-        db.scalars(select(HoldingSnapshot).where(HoldingSnapshot.is_current.is_(True)).order_by(HoldingSnapshot.snapshot_date.desc()))
-    )
+def holdings(as_of: date | None = None, db: Session = Depends(get_db)):
+    return as_dict_list(latest_holdings_as_of(db, as_of=as_of or date.today()))
 
 
 @router.post("/holdings/manual-snapshot")
@@ -34,8 +34,8 @@ def history(db: Session = Depends(get_db)):
 
 
 @router.get("/allocation")
-def allocation(db: Session = Depends(get_db)):
-    return asset_allocation(db)
+def allocation(mode: str = "investment_only", as_of: date | None = None, db: Session = Depends(get_db)):
+    return asset_allocation(db, as_of=as_of, mode=mode)
 
 
 @router.post("/allocation/overrides")
