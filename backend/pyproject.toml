@@ -1,0 +1,13 @@
+[project]
+name = "local-finance-app-backend"
+version = "1.0.0"
+description = "Local-only personal finance backend"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100

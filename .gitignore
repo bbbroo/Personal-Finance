@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+backend/.venv/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local finance data
+data/finance.sqlite3
+data/finance.sqlite3-*
+data/backups/
+data/imports/originals/
+data/imports/normalized/
+data/imports/logs/
+data/logs/
+data/secrets/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
