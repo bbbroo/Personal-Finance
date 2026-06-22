@@ -94,6 +94,25 @@ Price refresh is local-first. V1 marks stale/missing prices and supports manual 
 - Ledger is manual holdings only in V1; no private keys or seed phrases.
 - Manual edits, imports, rollbacks, rules, reconciliation, and review actions are audit logged.
 
+## Clean Distributable ZIP
+
+Create release zips from the repository root so local databases, backups, logs, caches, virtual environments, `node_modules`, and Git metadata are excluded:
+
+```powershell
+.\scripts\create-clean-zip.ps1
+```
+
+The script writes `release\local-finance-clean.zip` by default and excludes `.git`, `.ai-bridge`, `backend\.venv`, `frontend\node_modules`, `frontend\dist`, `frontend\=`, TypeScript build cache files, generated Vite config artifacts, `data\finance.sqlite3*`, `data\backups`, `data\imports`, `data\exports`, `data\logs`, `data\secrets`, and common cache folders.
+
+If Git is available and you only want tracked source files, this command is also safe:
+
+```powershell
+$dest = "release\local-finance-clean.zip"
+New-Item -ItemType Directory -Force release | Out-Null
+if (Test-Path $dest) { Remove-Item $dest }
+git archive --format=zip --output=$dest HEAD
+```
+
 ## Troubleshooting
 
 - Backend errors: check `data\logs\backend.log` and `data\logs\backend-uvicorn.log`.

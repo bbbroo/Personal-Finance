@@ -31,6 +31,13 @@ export type DataQualityIssue = ApiRecord & {
   status: string;
 };
 
+export type TrustChecklist = {
+  as_of: string;
+  overall_status: string;
+  warning_count: number;
+  checks: Record<string, Record<string, unknown> & { status: string }>;
+};
+
 export type DashboardReport = {
   net_worth: {
     net_worth_cents: number;

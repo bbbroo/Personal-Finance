@@ -11,6 +11,8 @@ import {
   Gauge,
   Landmark,
   LineChart,
+  ListChecks,
+  Map,
   PieChart,
   ReceiptText,
   Settings,
@@ -21,6 +23,8 @@ import {
 
 export const navItems = [
   { id: "dashboard", label: "Dashboard", icon: Gauge },
+  { id: "review", label: "Review Queue", icon: ListChecks },
+  { id: "buildout", label: "Build-out Plan", icon: Map },
   { id: "accounts", label: "Accounts", icon: Landmark },
   { id: "transactions", label: "Transactions", icon: ReceiptText },
   { id: "holdings", label: "Holdings", icon: Coins },

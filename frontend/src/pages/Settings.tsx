@@ -25,6 +25,25 @@ export function Settings() {
             <div className="flex justify-between"><span>Login/auth</span><Badge tone="success">not required in V1</Badge></div>
             <div className="flex justify-between"><span>Telemetry</span><Badge tone="success">off</Badge></div>
             <div className="flex justify-between"><span>Background scheduler</span><Badge tone="success">none</Badge></div>
+            <div className="flex justify-between"><span>Paid APIs required</span><Badge tone="success">no</Badge></div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardTitle>Privacy And Storage Boundaries</CardTitle></CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            <div className="flex justify-between"><span>Primary database</span><Badge tone="neutral">local SQLite</Badge></div>
+            <div className="flex justify-between"><span>Backups</span><Badge tone="neutral">local files</Badge></div>
+            <div className="flex justify-between"><span>Imports/exports</span><Badge tone="neutral">local folders</Badge></div>
+            <div className="flex justify-between"><span>Secrets folder</span><Badge tone="warning">never package/share</Badge></div>
+            <p className="rounded-md bg-muted p-3 text-muted-foreground">Before sharing a ZIP or moving machines, use the clean release script and verify local database, backups, logs, imports, exports, and secrets are excluded unless intentionally transferring personal data.</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardTitle>Default App Preferences</CardTitle></CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {Object.entries(settings.data ?? {}).length ? Object.entries(settings.data ?? {}).map(([key, value]) => (
+              <div key={key} className="flex justify-between gap-3"><span>{key}</span><Badge tone="neutral">{String(value)}</Badge></div>
+            )) : <p className="text-muted-foreground">No editable user preferences are exposed yet. Planned: currency, date format, fiscal month, default account, backup location, and theme.</p>}
           </CardContent>
         </Card>
         <Card>

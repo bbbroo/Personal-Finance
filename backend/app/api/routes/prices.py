@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.domain import Price, utc_now
+from app.models.domain import HoldingSnapshot, Price, utc_now
 from app.schemas.common import ManualPriceCreate
 from app.services.audit_service import record_audit
 from app.services.price_service import refresh_prices as refresh_prices_service
@@ -42,6 +42,21 @@ def manual_price(payload: ManualPriceCreate, db: Session = Depends(get_db)):
     )
     db.add(price)
     db.flush()
+    affected_holdings = list(
+        db.scalars(
+            select(HoldingSnapshot).where(
+                HoldingSnapshot.instrument_id == price.instrument_id,
+                HoldingSnapshot.is_current.is_(True),
+            )
+        )
+    )
     record_audit(db, entity_type="price", entity_id=price.id, action="create", after=price)
     db.commit()
-    return as_dict(price)
+    result = as_dict(price)
+    result["holding_valuation_warning"] = (
+        "Manual price was saved. Existing holding snapshots were not mutated; enter or import a new holding snapshot to update valuations."
+        if affected_holdings
+        else None
+    )
+    result["affected_current_holding_count"] = len(affected_holdings)
+    return result

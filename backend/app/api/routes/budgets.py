@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.models.domain import BudgetCategoryPlan, BudgetPeriod, RolloverLedger, SinkingFund
 from app.repositories.common import get_or_404
 from app.schemas.common import BudgetPeriodCreate, BudgetPlanCreate, RolloverAdjust, SinkingFundCreate
+from app.services.audit_service import record_audit
 from app.services.budget_service import budget_summary, close_period, sinking_fund_summary
 from app.services.serialization import as_dict, as_dict_list
 
@@ -23,6 +24,8 @@ def periods(db: Session = Depends(get_db)):
 def create_period(payload: BudgetPeriodCreate, db: Session = Depends(get_db)):
     period = BudgetPeriod(**payload.model_dump())
     db.add(period)
+    db.flush()
+    record_audit(db, entity_type="budget_period", entity_id=period.id, action="create", after=period)
     db.commit()
     return as_dict(period)
 
@@ -30,16 +33,22 @@ def create_period(payload: BudgetPeriodCreate, db: Session = Depends(get_db)):
 @router.patch("/budget-periods/{period_id}")
 def update_period(period_id: str, payload: dict, db: Session = Depends(get_db)):
     period = get_or_404(db, BudgetPeriod, period_id)
+    before = as_dict(period)
     for key, value in payload.items():
         if hasattr(period, key):
             setattr(period, key, value)
+    db.flush()
+    record_audit(db, entity_type="budget_period", entity_id=period.id, action="update", before=before, after=period)
     db.commit()
     return as_dict(period)
 
 
 @router.post("/budget-periods/{period_id}/close")
 def close(period_id: str, db: Session = Depends(get_db)):
-    period = close_period(db, get_or_404(db, BudgetPeriod, period_id))
+    period = get_or_404(db, BudgetPeriod, period_id)
+    before = as_dict(period)
+    period = close_period(db, period)
+    record_audit(db, entity_type="budget_period", entity_id=period.id, action="close", before=before, after=period)
     db.commit()
     return as_dict(period)
 
@@ -53,6 +62,8 @@ def budgets(db: Session = Depends(get_db)):
 def create_budget(payload: BudgetPlanCreate, db: Session = Depends(get_db)):
     plan = BudgetCategoryPlan(**payload.model_dump())
     db.add(plan)
+    db.flush()
+    record_audit(db, entity_type="budget_category_plan", entity_id=plan.id, action="create", after=plan)
     db.commit()
     return as_dict(plan)
 
@@ -60,9 +71,12 @@ def create_budget(payload: BudgetPlanCreate, db: Session = Depends(get_db)):
 @router.patch("/budgets/{budget_plan_id}")
 def update_budget(budget_plan_id: str, payload: dict, db: Session = Depends(get_db)):
     plan = get_or_404(db, BudgetCategoryPlan, budget_plan_id)
+    before = as_dict(plan)
     for key, value in payload.items():
         if hasattr(plan, key):
             setattr(plan, key, value)
+    db.flush()
+    record_audit(db, entity_type="budget_category_plan", entity_id=plan.id, action="update", before=before, after=plan)
     db.commit()
     return as_dict(plan)
 
@@ -80,10 +94,23 @@ def adjust_rollover(payload: RolloverAdjust, db: Session = Depends(get_db)):
             RolloverLedger.budget_period_id == payload.budget_period_id,
         )
     ).first()
+    created = False
     if ledger is None:
         ledger = RolloverLedger(category_id=payload.category_id, budget_period_id=payload.budget_period_id)
         db.add(ledger)
+        db.flush()
+        created = True
+    before = None if created else as_dict(ledger)
     ledger.adjustment_cents += payload.adjustment_cents
+    db.flush()
+    record_audit(
+        db,
+        entity_type="rollover_ledger",
+        entity_id=ledger.id,
+        action="adjust",
+        before=before,
+        after=ledger,
+    )
     db.commit()
     return as_dict(ledger)
 
@@ -97,6 +124,8 @@ def sinking_funds(db: Session = Depends(get_db)):
 def create_sinking_fund(payload: SinkingFundCreate, db: Session = Depends(get_db)):
     fund = SinkingFund(**payload.model_dump())
     db.add(fund)
+    db.flush()
+    record_audit(db, entity_type="sinking_fund", entity_id=fund.id, action="create", after=fund)
     db.commit()
     return as_dict(fund)
 
@@ -104,8 +133,11 @@ def create_sinking_fund(payload: SinkingFundCreate, db: Session = Depends(get_db
 @router.patch("/sinking-funds/{fund_id}")
 def update_sinking_fund(fund_id: str, payload: dict, db: Session = Depends(get_db)):
     fund = get_or_404(db, SinkingFund, fund_id)
+    before = as_dict(fund)
     for key, value in payload.items():
         if hasattr(fund, key):
             setattr(fund, key, value)
+    db.flush()
+    record_audit(db, entity_type="sinking_fund", entity_id=fund.id, action="update", before=before, after=fund)
     db.commit()
     return as_dict(fund)

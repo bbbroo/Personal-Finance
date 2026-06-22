@@ -284,6 +284,8 @@ def remap_batch(db: Session, batch: ImportBatch, mapping: dict[str, str | None])
         preset.version += 1
         preset.mapping_json = mapping
         batch.mapping_preset_version = preset.version
+    old_staged_ids = [row.id for row in batch.staged_rows if row.id]
+    _delete_system_transfer_links_for_staged_rows(db, old_staged_ids)
     db.execute(delete(StagedImportRow).where(StagedImportRow.import_batch_id == batch.id))
     text = original.read_text(encoding="utf-8-sig")
     reader = csv.DictReader(StringIO(text))
@@ -472,6 +474,93 @@ def _transfer_member_exists(db: Session, link_id: str, *, transaction_id: str | 
     return bool(db.scalar(query.limit(1)))
 
 
+def _delete_system_transfer_links_for_staged_rows(db: Session, staged_row_ids: list[str]) -> None:
+    """Remove system-created transfer candidates before staged rows are changed/deleted.
+
+    TransferLinkMember uses SET NULL for staged rows so deleting staged rows first can leave
+    orphaned system links with no useful members. System candidates are safe to rebuild.
+    """
+    if not staged_row_ids:
+        return
+    link_ids = list(
+        db.scalars(
+            select(TransferLinkMember.transfer_link_id).where(
+                TransferLinkMember.staged_row_id.in_(staged_row_ids)
+            )
+        )
+    )
+    for link_id in set(link_ids):
+        link = db.get(TransferLink, link_id)
+        if link and link.created_by == "system":
+            db.delete(link)
+    db.flush()
+
+
+def _row_is_commit_eligible(row: StagedImportRow) -> bool:
+    return not (
+        row.user_action == UserAction.SKIP
+        or row.validation_status in {StagedRowStatus.ERROR, StagedRowStatus.SKIPPED}
+        or row.duplicate_status in {DuplicateStatus.DUPLICATE, DuplicateStatus.CONFIRMED_DUPLICATE}
+    )
+
+
+def _assert_confirmed_transfer_pairs_complete(db: Session, batch: ImportBatch) -> None:
+    rows_by_id = {row.id: row for row in batch.staged_rows}
+    for row in batch.staged_rows:
+        if row.transfer_status != TransferStatus.CONFIRMED_TRANSFER or not _row_is_commit_eligible(row):
+            continue
+        candidate = (row.normalized_json or {}).get("transfer_candidate")
+        link = db.get(TransferLink, candidate.get("transfer_link_id")) if candidate else None
+        if not candidate or not link:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": "INCOMPLETE_CONFIRMED_TRANSFER_PAIR",
+                    "message": "A confirmed transfer row has no valid transfer pair link.",
+                    "details": {"staged_row_id": row.id},
+                    "recommended_action": "Re-run transfer detection or downgrade the row to suggested/not transfer before committing.",
+                },
+            )
+        if candidate.get("candidate_type") == "staged_row":
+            other = rows_by_id.get(candidate.get("candidate_id"))
+            if (
+                other is None
+                or other.transfer_status != TransferStatus.CONFIRMED_TRANSFER
+                or not _row_is_commit_eligible(other)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "INCOMPLETE_CONFIRMED_TRANSFER_PAIR",
+                        "message": "A confirmed transfer pair is incomplete because one staged side will not be committed.",
+                        "details": {"staged_row_id": row.id, "paired_staged_row_id": candidate.get("candidate_id")},
+                        "recommended_action": "Commit both sides, or downgrade/reject the remaining row so it stays included in cash flow.",
+                    },
+                )
+        elif candidate.get("candidate_type") == "transaction":
+            existing = db.get(Transaction, candidate.get("candidate_id"))
+            if existing is None or existing.account_id == row.normalized_json.get("account_id"):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "INCOMPLETE_CONFIRMED_TRANSFER_PAIR",
+                        "message": "A confirmed transfer row is linked to a missing or invalid existing transaction.",
+                        "details": {"staged_row_id": row.id, "transaction_id": candidate.get("candidate_id")},
+                        "recommended_action": "Re-run transfer detection or downgrade the row before committing.",
+                    },
+                )
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": "INCOMPLETE_CONFIRMED_TRANSFER_PAIR",
+                    "message": "A confirmed transfer row has an unsupported pair type.",
+                    "details": {"staged_row_id": row.id, "candidate_type": candidate.get("candidate_type")},
+                    "recommended_action": "Re-run transfer detection or downgrade the row before committing.",
+                },
+            )
+
+
 def _set_transfer_candidate(
     row: StagedImportRow,
     *,
@@ -505,17 +594,7 @@ def detect_transfers(db: Session, batch: ImportBatch) -> ImportBatch:
         raise HTTPException(status_code=409, detail="Committed or rolled back imports cannot be re-detected.")
     rows = [row for row in batch.staged_rows if row.validation_status != StagedRowStatus.ERROR]
     staged_ids = [row.id for row in rows if row.id]
-    if staged_ids:
-        link_ids = list(
-            db.scalars(
-                select(TransferLinkMember.transfer_link_id).where(TransferLinkMember.staged_row_id.in_(staged_ids))
-            )
-        )
-        for link_id in set(link_ids):
-            link = db.get(TransferLink, link_id)
-            if link and link.created_by == "system" and link.status in {"suggested", "confirmed"}:
-                db.delete(link)
-        db.flush()
+    _delete_system_transfer_links_for_staged_rows(db, staged_ids)
     for row in rows:
         if row.transfer_status != TransferStatus.REJECTED_TRANSFER:
             row.transfer_status = TransferStatus.NOT_TRANSFER
@@ -706,6 +785,7 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
     if batch.status in {ImportStatus.COMMITTED, ImportStatus.ROLLED_BACK}:
         raise HTTPException(status_code=409, detail=f"Import batch is already {batch.status}.")
     validate_batch(db, batch)
+    _assert_confirmed_transfer_pairs_complete(db, batch)
     if batch.error_count:
         raise HTTPException(
             status_code=422,

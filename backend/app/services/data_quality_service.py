@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 
 from sqlalchemy import delete, select
+
+from app.core.security import normalized_hash
 from sqlalchemy.orm import Session
 
 from app.models.domain import (
@@ -10,7 +12,9 @@ from app.models.domain import (
     AccountBalanceSnapshot,
     AccountStatement,
     DataQualityIssue,
+    DebtPaymentAllocation,
     HoldingSnapshot,
+    Instrument,
     Liability,
     LiabilityTermsHistory,
     Price,
@@ -18,12 +22,45 @@ from app.models.domain import (
 from app.services.holding_service import latest_holdings_as_of
 
 
+PRICE_STALE_DAYS = {
+    "crypto": 2,
+    "stock": 3,
+    "etf": 3,
+    "mutual_fund": 3,
+}
+
+
+def _issue_fingerprint(issue: DataQualityIssue | dict) -> str:
+    getter = issue.get if isinstance(issue, dict) else lambda key: getattr(issue, key)
+    return normalized_hash(
+        [
+            getter("issue_type"),
+            getter("entity_type"),
+            getter("entity_id"),
+            getter("title"),
+            getter("description"),
+            getter("recommended_action"),
+        ]
+    )
+
+
 def _issue(**kwargs) -> DataQualityIssue:
-    return DataQualityIssue(status="open", **kwargs)
+    fingerprint = _issue_fingerprint(kwargs)
+    return DataQualityIssue(status="open", fingerprint=fingerprint, **kwargs)
+
+
+def _persist_issues_preserving_ignored(db: Session, issues: list[DataQualityIssue]) -> list[DataQualityIssue]:
+    ignored_fingerprints = set(
+        db.scalars(select(DataQualityIssue.fingerprint).where(DataQualityIssue.status == "ignored"))
+    )
+    db.execute(delete(DataQualityIssue).where(DataQualityIssue.status == "open"))
+    fresh_issues = [issue for issue in issues if issue.fingerprint not in ignored_fingerprints]
+    db.add_all(fresh_issues)
+    db.flush()
+    return fresh_issues
 
 
 def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
-    db.execute(delete(DataQualityIssue).where(DataQualityIssue.status == "open"))
     today = date.today()
     issues: list[DataQualityIssue] = []
 
@@ -129,6 +166,18 @@ def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
         )
 
     for liability in db.scalars(select(Liability).where(Liability.status == "active")):
+        if liability.current_balance_cents <= 0:
+            issues.append(
+                _issue(
+                    severity="warning",
+                    issue_type="missing_liability_terms",
+                    entity_type="liability",
+                    entity_id=liability.id,
+                    title="Liability is missing a positive balance",
+                    description="Debt payoff projections need a current positive balance.",
+                    recommended_action="Update the liability balance before relying on payoff projections.",
+                )
+            )
         terms = db.scalars(
             select(LiabilityTermsHistory)
             .where(LiabilityTermsHistory.liability_id == liability.id)
@@ -158,6 +207,49 @@ def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
                     recommended_action="Add current APR terms for this liability.",
                 )
             )
+        if not db.scalar(select(DebtPaymentAllocation.id).where(DebtPaymentAllocation.liability_id == liability.id).limit(1)):
+            issues.append(
+                _issue(
+                    severity="info",
+                    issue_type="missing_liability_terms",
+                    entity_type="liability",
+                    entity_id=liability.id,
+                    title="Liability is missing payment allocation history",
+                    description="Debt payoff projections are estimated until principal, interest, and fee allocations are entered or imported.",
+                    recommended_action="Add payment allocations for recent debt payments.",
+                )
+            )
+
+    for instrument in db.scalars(select(Instrument).where(Instrument.is_active.is_(True))):
+        latest_price = db.scalars(
+            select(Price).where(Price.instrument_id == instrument.id).order_by(Price.price_date.desc(), Price.created_at.desc())
+        ).first()
+        if latest_price is None:
+            issues.append(
+                _issue(
+                    severity="warning",
+                    issue_type="stale_price",
+                    entity_type="instrument",
+                    entity_id=instrument.id,
+                    title=f"{instrument.symbol} is missing a price",
+                    description="No price exists for this active instrument, so holding valuations may be missing or stale.",
+                    recommended_action="Enter a manual price or import/refresh prices.",
+                )
+            )
+        else:
+            threshold = PRICE_STALE_DAYS.get(instrument.instrument_type, 7)
+            if latest_price.price_date and (today - latest_price.price_date).days > threshold:
+                issues.append(
+                    _issue(
+                        severity="warning",
+                        issue_type="stale_price",
+                        entity_type="instrument",
+                        entity_id=instrument.id,
+                        title=f"{instrument.symbol} price is stale",
+                        description=f"Latest price is from {latest_price.price_date.isoformat()}.",
+                        recommended_action="Refresh prices or enter a manual override.",
+                    )
+                )
 
     for price in db.scalars(select(Price).where(Price.status.in_(["stale", "missing", "failed"]))):
         issues.append(
@@ -172,11 +264,11 @@ def recompute_data_quality(db: Session) -> list[DataQualityIssue]:
             )
         )
 
-    db.add_all(issues)
-    db.flush()
-    return issues
+    return _persist_issues_preserving_ignored(db, issues)
 
 
 def ignore_issue(db: Session, issue: DataQualityIssue) -> DataQualityIssue:
+    if issue.fingerprint is None:
+        issue.fingerprint = _issue_fingerprint(issue)
     issue.status = "ignored"
     return issue

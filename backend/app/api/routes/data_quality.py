@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.domain import DataQualityIssue
 from app.repositories.common import get_or_404
+from app.services.audit_service import record_audit
 from app.services.data_quality_service import ignore_issue, recompute_data_quality
 from app.services.serialization import as_dict, as_dict_list
 
@@ -20,7 +21,11 @@ def issues(db: Session = Depends(get_db)):
 
 @router.post("/issues/{issue_id}/ignore")
 def ignore(issue_id: str, db: Session = Depends(get_db)):
-    issue = ignore_issue(db, get_or_404(db, DataQualityIssue, issue_id))
+    issue = get_or_404(db, DataQualityIssue, issue_id)
+    before = as_dict(issue)
+    issue = ignore_issue(db, issue)
+    db.flush()
+    record_audit(db, entity_type="data_quality_issue", entity_id=issue.id, action="ignore", before=before, after=issue)
     db.commit()
     return as_dict(issue)
 

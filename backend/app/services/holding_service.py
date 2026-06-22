@@ -81,7 +81,12 @@ def create_holding_snapshot(db: Session, payload: HoldingCreate) -> HoldingSnaps
     if market_value is not None and payload.cost_basis_cents is not None:
         gain = market_value - payload.cost_basis_cents
         gain_pct = percent(gain, payload.cost_basis_cents)
-    confidence = "verified" if payload.cost_basis_quality in {"verified", "user_entered"} else "low"
+    if payload.cost_basis_cents is None or payload.cost_basis_quality == "missing":
+        confidence = "unknown"
+    elif payload.cost_basis_quality in {"verified", "user_entered"} and payload.cost_basis_source != "coinbase_api_inferred":
+        confidence = "verified"
+    else:
+        confidence = "low"
 
     if is_current:
         for previous in list(

@@ -7,7 +7,22 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import normalized_hash
-from app.models.domain import MonthlyReviewSnapshot, Transaction, utc_now
+from app.models.domain import (
+    AccountBalanceSnapshot,
+    AccountStatement,
+    BudgetCategoryPlan,
+    BudgetPeriod,
+    Category,
+    DataQualityIssue,
+    HoldingSnapshot,
+    Liability,
+    MonthlyReviewSnapshot,
+    Price,
+    ReconciliationRun,
+    Transaction,
+    TransactionSplit,
+    utc_now,
+)
 from app.services.audit_service import record_audit
 from app.services.report_service import calculate_net_worth, cash_flow, spending_by_category
 
@@ -17,11 +32,87 @@ def _bounds(yyyy_mm: str) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
 
+def _row_fingerprint(label: str, row, fields: list[str]) -> str:
+    values = [label, getattr(row, "id", None)]
+    for field in fields:
+        value = getattr(row, field, None)
+        values.append(value.isoformat() if hasattr(value, "isoformat") else value)
+    return ":".join(str(value) for value in values)
+
+
 def _source_hash(db: Session, start: date, end: date) -> str:
-    txns = db.scalars(
-        select(Transaction).where(Transaction.transaction_date >= start, Transaction.transaction_date <= end)
-    )
-    parts = [f"{txn.id}:{txn.updated_at.isoformat()}:{txn.amount_cents}" for txn in txns]
+    """Hash all persisted source data that can materially affect a finalized review."""
+    parts: list[str] = []
+    for txn in db.scalars(select(Transaction).where(Transaction.transaction_date >= start, Transaction.transaction_date <= end)):
+        parts.append(
+            _row_fingerprint(
+                "transaction",
+                txn,
+                [
+                    "account_id",
+                    "transaction_date",
+                    "amount_cents",
+                    "category_id",
+                    "transaction_type",
+                    "transfer_status",
+                    "is_hidden",
+                    "is_split",
+                    "updated_at",
+                ],
+            )
+        )
+    for split in db.scalars(select(TransactionSplit)):
+        txn = db.get(Transaction, split.transaction_id)
+        if txn and start <= txn.transaction_date <= end:
+            parts.append(_row_fingerprint("transaction_split", split, ["transaction_id", "category_id", "amount_cents"]))
+    for category in db.scalars(select(Category)):
+        parts.append(_row_fingerprint("category", category, ["category_type", "budget_behavior", "is_active"]))
+    for balance in db.scalars(select(AccountBalanceSnapshot).where(AccountBalanceSnapshot.snapshot_date <= end)):
+        parts.append(
+            _row_fingerprint(
+                "balance",
+                balance,
+                ["account_id", "snapshot_date", "balance_cents", "balance_kind", "confidence", "is_reconciled", "updated_at"],
+            )
+        )
+    for holding in db.scalars(select(HoldingSnapshot).where(HoldingSnapshot.snapshot_date <= end)):
+        parts.append(
+            _row_fingerprint(
+                "holding",
+                holding,
+                [
+                    "account_id",
+                    "instrument_id",
+                    "snapshot_date",
+                    "quantity_decimal",
+                    "price_decimal",
+                    "market_value_cents",
+                    "cost_basis_cents",
+                    "cost_basis_quality",
+                    "valuation_quality",
+                    "confidence",
+                    "is_current",
+                ],
+            )
+        )
+    for price in db.scalars(select(Price).where(Price.price_date <= end)):
+        parts.append(_row_fingerprint("price", price, ["instrument_id", "price_date", "price_decimal", "status", "confidence"]))
+    for period in db.scalars(select(BudgetPeriod).where(BudgetPeriod.start_date <= end, BudgetPeriod.end_date >= start)):
+        parts.append(_row_fingerprint("budget_period", period, ["period_type", "start_date", "end_date", "status", "closed_at"]))
+    for plan in db.scalars(select(BudgetCategoryPlan)):
+        period = db.get(BudgetPeriod, plan.budget_period_id)
+        if period and period.start_date <= end and period.end_date >= start:
+            parts.append(_row_fingerprint("budget_plan", plan, ["budget_period_id", "category_id", "planned_cents", "rollover_enabled", "plan_type"]))
+    for liability in db.scalars(select(Liability).where(Liability.status == "active")):
+        parts.append(_row_fingerprint("liability", liability, ["account_id", "current_balance_cents", "minimum_payment_cents", "credit_limit_cents", "confidence", "updated_at"]))
+    for statement in db.scalars(select(AccountStatement).where(AccountStatement.period_start <= end, AccountStatement.period_end >= start)):
+        parts.append(_row_fingerprint("account_statement", statement, ["account_id", "period_start", "period_end", "status", "ending_balance_cents"]))
+    for run in db.scalars(select(ReconciliationRun)):
+        statement = db.get(AccountStatement, run.account_statement_id)
+        if statement and statement.period_start <= end and statement.period_end >= start:
+            parts.append(_row_fingerprint("reconciliation", run, ["account_statement_id", "difference_cents", "status", "run_at"]))
+    for issue in db.scalars(select(DataQualityIssue).where(DataQualityIssue.status.in_(["open", "ignored"]))) :
+        parts.append(_row_fingerprint("data_quality", issue, ["issue_type", "entity_type", "entity_id", "fingerprint", "status", "resolved_at"]))
     return normalized_hash(sorted(parts))
 
 
@@ -96,7 +187,14 @@ def finalize_review(db: Session, yyyy_mm: str) -> MonthlyReviewSnapshot:
 
 
 def regenerate_review(db: Session, yyyy_mm: str) -> MonthlyReviewSnapshot:
+    existing = db.scalars(select(MonthlyReviewSnapshot).where(MonthlyReviewSnapshot.review_month == yyyy_mm)).first()
+    before = None if existing is None else {
+        "id": existing.id,
+        "review_month": existing.review_month,
+        "status": existing.status,
+        "source_data_hash": existing.source_data_hash,
+    }
     snapshot = finalize_review(db, yyyy_mm)
     snapshot.status = "regenerated"
-    record_audit(db, entity_type="monthly_review", entity_id=snapshot.id, action="regenerate", after=snapshot)
+    record_audit(db, entity_type="monthly_review", entity_id=snapshot.id, action="regenerate", before=before, after=snapshot)
     return snapshot

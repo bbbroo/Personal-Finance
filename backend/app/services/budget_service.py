@@ -13,8 +13,17 @@ from app.models.domain import (
 )
 
 
+def _budget_signed_amount(amount_cents: int, category: Category | None) -> int:
+    if category and category.category_type == "income":
+        return amount_cents
+    if category and category.category_type == "expense":
+        return -amount_cents
+    return abs(amount_cents) if amount_cents < 0 else amount_cents
+
+
 def category_actual_cents(db: Session, category_id: str, period: BudgetPeriod) -> int:
     actual = 0
+    target_category = db.get(Category, category_id)
     txns = db.scalars(
         select(Transaction).where(
             Transaction.transaction_date >= period.start_date,
@@ -27,9 +36,9 @@ def category_actual_cents(db: Session, category_id: str, period: BudgetPeriod) -
         if txn.is_split and txn.splits:
             for split in txn.splits:
                 if split.category_id == category_id:
-                    actual += abs(split.amount_cents) if split.amount_cents < 0 else split.amount_cents
+                    actual += _budget_signed_amount(split.amount_cents, target_category)
         elif txn.category_id == category_id:
-            actual += abs(txn.amount_cents) if txn.amount_cents < 0 else txn.amount_cents
+            actual += _budget_signed_amount(txn.amount_cents, target_category)
     return actual
 
 

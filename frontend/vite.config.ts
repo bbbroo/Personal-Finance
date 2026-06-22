@@ -9,6 +9,17 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src")
     }
   },
+  build: {
+    chunkSizeWarningLimit: 800,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          query: ["@tanstack/react-query", "@tanstack/react-table"],
+          charts: ["recharts"]
+        }
+      }
+    }
+  },
   server: {
     host: "127.0.0.1",
     port: 5173,

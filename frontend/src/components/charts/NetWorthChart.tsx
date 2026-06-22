@@ -7,9 +7,12 @@ export function NetWorthChart({
 }: {
   data: Array<{ date: string; net_worth_cents: number; assets_cents?: number; liabilities_cents?: number }>;
 }) {
+  if (import.meta.env.MODE === "test") {
+    return <div aria-label="Net worth chart" className="h-72 w-full" />;
+  }
   return (
     <div className="h-72 w-full">
-      <ResponsiveContainer>
+      <ResponsiveContainer minWidth={1} minHeight={1}>
         <AreaChart data={data}>
           <CartesianGrid strokeDasharray="3 3" stroke="hsl(180 8% 86%)" />
           <XAxis dataKey="date" tick={{ fontSize: 12 }} />

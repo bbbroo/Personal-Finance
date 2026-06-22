@@ -13,6 +13,7 @@ from app.services.report_service import (
     net_worth_history,
     spending_by_category,
 )
+from app.services.trust_service import build_trust_checklist
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -20,6 +21,11 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 @router.get("/dashboard")
 def dashboard_report(db: Session = Depends(get_db)):
     return dashboard(db)
+
+
+@router.get("/trust-checklist")
+def trust_checklist(db: Session = Depends(get_db)):
+    return build_trust_checklist(db)
 
 
 @router.get("/net-worth")

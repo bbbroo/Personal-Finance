@@ -8,6 +8,7 @@ import { Allocation } from "@/pages/Allocation";
 import { AuditLog } from "@/pages/AuditLog";
 import { Backups } from "@/pages/Backups";
 import { Budgets } from "@/pages/Budgets";
+import { BuildoutPlan } from "@/pages/BuildoutPlan";
 import { Dashboard } from "@/pages/Dashboard";
 import { DataQuality } from "@/pages/DataQuality";
 import { Goals } from "@/pages/Goals";
@@ -18,12 +19,15 @@ import { MonthlyReview } from "@/pages/MonthlyReview";
 import { NetWorth } from "@/pages/NetWorth";
 import { Reconciliation } from "@/pages/Reconciliation";
 import { RecurringCalendar } from "@/pages/RecurringCalendar";
+import { ReviewQueue } from "@/pages/ReviewQueue";
 import { Settings } from "@/pages/Settings";
 import { Status } from "@/pages/Status";
 import { Transactions } from "@/pages/Transactions";
 
 const pages: Record<PageId, React.ComponentType> = {
   dashboard: Dashboard,
+  review: ReviewQueue,
+  buildout: BuildoutPlan,
   accounts: Accounts,
   transactions: Transactions,
   holdings: Holdings,
